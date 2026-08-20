@@ -1,0 +1,9 @@
+mcp>=1.26,<2
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+python-dotenv>=1.0
+requests>=2.32
+streamlit>=1.32,<2
+mistralai>=1.0,<2
