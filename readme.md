@@ -7,22 +7,100 @@ through a single [Model Context Protocol](https://modelcontextprotocol.io)
 (MCP) server.
 
 ```
-Streamlit UI (app.py)
-        │
-        ▼
-  MCPClient (mcp_client.py)  ──HTTP (Streamable HTTP transport)──▶  FastMCP server (server.py)
-        │                                                                  │
-        │                                                    ┌────────────┴────────────┐
-        ▼                                                    ▼                          ▼
-EmailAssistant (ai_agent.py)                          GmailService                 SAPService
-  → Mistral LLM, tool-calling                       (gmail_service.py)          (sap_service.py)
-                                                              │                          │
-                                                       Gmail API (OAuth)         SAP OData (API key)
+                              Streamlit UI (app.py)
+                                       │
+                       ┌───────────────┴───────────────┐
+                       ▼                                ▼
+           Gmail / SAP / Admin tabs                  Ai tab
+           (direct button click)              EmailAssistant (ai_agent.py)
+                       │                       → Mistral LLM decides which
+                       │                         tool(s) to call, if any
+                       │                                │
+                       └───────────────┬────────────────┘
+                                        ▼
+                     MCPClient (mcp_client.py) — one persistent
+                     background event loop for every call, either path
+                                        │
+                                        │  Streamable HTTP transport
+                                        ▼
+                        FastMCP server (server.py) — dispatches
+                              the tool call by name
+                                        │
+                       ┌────────────────┴────────────────┐
+                       ▼                                  ▼
+                GmailService                        SAPService
+              (gmail_service.py)                  (sap_service.py)
+                       │                                  │
+                       ▼                                  ▼
+                  Gmail API                          SAP OData API
+                (OAuth credentials)                  (API key, sandbox)
 ```
 
-The UI never talks to Gmail or SAP directly — every action goes through
-`MCPClient`, which calls tools exposed by the FastMCP server. This keeps a
-single, auditable boundary between the app and the two external systems.
+The UI never talks to Gmail or SAP directly — every action, whether it's a
+button click or something the AI assistant decided to do, goes through the
+same `MCPClient` → FastMCP server → service layer path. This keeps a single,
+auditable boundary between the app and the two external systems.
+
+## Request flow
+
+There are two ways a request enters the system, and they converge at
+`MCPClient`.
+
+### 1. Direct UI action (Gmail / SAP / Admin tabs)
+
+1. You click a button (e.g. "Search" in the Gmail tab). `app.py` calls a
+   method directly on the shared `MCPClient` instance, e.g.
+   `mcp_client.gmail_search_messages(query, max_results)`.
+2. `MCPClient` schedules that coroutine on its dedicated background event
+   loop and blocks until it completes (`_loop.run(...)` in `mcp_client.py`)
+   — this is what keeps the MCP session safe across Streamlit's
+   rerun-per-interaction model.
+3. The FastMCP server (`server.py`) receives the tool call over Streamable
+   HTTP and dispatches it to the matching function, e.g.
+   `gmail_search_messages()`.
+4. That function calls into `GmailService` (`gmail_service.py`) or
+   `SAPService` (`sap_service.py`), which makes the real network call —
+   the Gmail API (OAuth) or the SAP OData API (API key) — and returns
+   parsed, plain-dict results.
+5. The result travels back up: MCP server → `MCPClient._unwrap()` →
+   `app.py`, which stores it in `st.session_state` and renders it.
+
+Errors at any layer (`MCPToolError`, `MCPConnectionError`, or anything
+unexpected) are caught centrally by `run_action()` in `app.py` and shown
+as an `st.error`, so a failed call never crashes the UI.
+
+### 2. AI Assistant question (Ai tab)
+
+This is the same pipeline with a decision loop in front of it:
+
+1. Your question (plus chat history) goes to `EmailAssistant.ask()` in
+   `ai_agent.py`, which builds a system prompt via `prompts.py` (injected
+   with today's/tomorrow's dates) and sends it to Mistral along with the
+   `TOOLS` schema.
+2. Mistral decides whether it needs a tool. If so, `ai_agent.py` runs the
+   call through the **same** `MCPClient` instance used by the manual tabs
+   — `EmailAssistant` never talks to Gmail/SAP itself — and feeds the
+   JSON result back into the conversation.
+3. Steps 1–2 repeat (search, then maybe read a specific message, then
+   maybe another search) up to `MISTRAL_MAX_STEPS` times (default 12).
+4. Once Mistral has enough information, it stops calling tools and
+   returns a final natural-language answer, which `app.py` renders in the
+   chat — with the full tool-call trace available in a collapsible
+   "Tool calls used" expander for debugging.
+
+The agent's tool list is deliberately narrow (read-only Gmail/SAP
+lookups), so no matter what you ask it, it cannot send, delete, or modify
+anything. Only the manual flows in the Gmail tab can do that, and each of
+those requires an explicit confirmation step before the destructive
+action fires.
+
+### 3. App startup (once per process)
+
+`get_mcp_client()` in `app.py` is wrapped in `@st.cache_resource`, so it
+runs exactly once: it creates the `MCPClient`, calls `.connect()`, which
+starts the background thread + event loop and opens the Streamable HTTP
+session to the FastMCP server. That session stays alive for the life of
+the Streamlit process — it is *not* recreated on every rerun.
 
 ## Features
 
