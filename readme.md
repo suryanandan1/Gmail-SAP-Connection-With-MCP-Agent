@@ -10,14 +10,14 @@ through a single [Model Context Protocol](https://modelcontextprotocol.io)
                               Streamlit UI (app.py)
                                        │
                        ┌───────────────┴───────────────┐
-                       ▼                                ▼
+                       ▼                               ▼
            Gmail / SAP / Admin tabs                  Ai tab
            (direct button click)              EmailAssistant (ai_agent.py)
                        │                       → Mistral LLM decides which
                        │                         tool(s) to call, if any
                        │                                │
                        └───────────────┬────────────────┘
-                                        ▼
+                                       ▼
                      MCPClient (mcp_client.py) — one persistent
                      background event loop for every call, either path
                                         │
@@ -27,7 +27,7 @@ through a single [Model Context Protocol](https://modelcontextprotocol.io)
                               the tool call by name
                                         │
                        ┌────────────────┴────────────────┐
-                       ▼                                  ▼
+                       ▼                                 ▼
                 GmailService                        SAPService
               (gmail_service.py)                  (sap_service.py)
                        │                                  │
