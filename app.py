@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from typing import Any, Callable
 
 import streamlit as st
@@ -59,8 +60,40 @@ def show_email(message: dict[str, Any]) -> None:
     attachments = message.get("attachments") or []
     if attachments:
         st.caption(f"{len(attachments)} attachment(s)")
-        for att in attachments:
-            st.write(f" {att.get('filename', 'unnamed')} ({att.get('size', 0)} bytes)")
+        message_id = message.get("message_id", "")
+        for att_index, att in enumerate(attachments):
+            filename = att.get("filename") or "unnamed"
+            size = att.get("size", 0)
+            attachment_id = att.get("attachment_id") or ""
+            data_key = f"attach_data_{message_id}_{att_index}"
+
+            col1, col2 = st.columns([4, 1])
+            col1.write(f" {filename} ({size} bytes)")
+
+            if not attachment_id:
+                col2.caption("Not downloadable")
+                continue
+
+            if st.session_state.get(data_key) is None:
+                if col2.button(
+                    "Prepare download",
+                    key=f"attach_fetch_{message_id}_{att_index}",
+                ):
+                    result = run_action(
+                        mcp_client.gmail_get_attachment, message_id, attachment_id
+                    )
+                    if result and result.get("data_base64"):
+                        st.session_state[data_key] = base64.b64decode(
+                            result["data_base64"]
+                        )
+                        st.rerun()
+            else:
+                col2.download_button(
+                    "Download",
+                    data=st.session_state[data_key],
+                    file_name=filename,
+                    key=f"attach_dl_{message_id}_{att_index}",
+                )
 
 
 def show_email_results(messages: list[dict[str, Any]] | None, key_prefix: str) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime, timedelta
 from typing import Any
@@ -8,164 +9,159 @@ from typing import Any
 from dotenv import load_dotenv
 from mistralai import Mistral
 
-from mcp_client import MCPClient, MCPConnectionError, MCPToolError
+from mcp_client import MCPClient, MCPConnectionError, MCPToolError, READ_ONLY_PREFIXES
 from prompts import build_system_prompt
 
 load_dotenv()
+
+logger = logging.getLogger("ai_agent")
 
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-large-latest").strip()
 MAX_AGENT_STEPS = int(os.getenv("MISTRAL_MAX_STEPS", "12"))
 
-TOOLS = [
-    {
+# The read-only/mutating boundary is enforced once, in MCPClient
+# (discover_safe_tools() / READ_ONLY_PREFIXES) - not duplicated here. This
+# agent only ever asks the client for the pre-filtered "safe" tool set, so
+# there is exactly one place in the codebase that decides what counts as
+# read-only. See readme.md "Safety notes".
+
+
+def _mcp_tool_to_mistral_function(tool: dict[str, Any]) -> dict[str, Any]:
+    """
+    MCP discovery metadata -> Mistral tool-calling schema.
+
+    MCP:      {"name": ..., "description": ..., "inputSchema": {...}}
+    Mistral:  {"type": "function", "function": {"name", "description", "parameters"}}
+
+    inputSchema is already a JSON-schema dict (mcp.types.Tool.inputSchema),
+    so it maps directly onto Mistral's "parameters" with no reshaping.
+    """
+    return {
         "type": "function",
         "function": {
-            "name": "gmail_search_messages",
-            "description": "Search Gmail messages.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "max_results": {"type": "integer", "default": 10},
-                },
-                "required": ["query"],
+            "name": tool["name"],
+            "description": tool.get("description") or "",
+            "parameters": tool.get("inputSchema") or {"type": "object", "properties": {}},
+        },
+    }
+
+
+# Static fallback used only if live discovery fails (e.g. MCP server
+# unreachable when EmailAssistant is constructed). Kept in the exact shape
+# MCPClient.discover_tools() produces - {"name", "description",
+# "inputSchema"} - and run through the same _mcp_tool_to_mistral_function()
+# converter as live-discovered tools, so this is the *only* place a
+# hand-maintained list still exists, and only as a degraded-mode fallback.
+_FALLBACK_TOOLS_METADATA: list[dict[str, Any]] = [
+    {
+        "name": "gmail_search_messages",
+        "description": "Search Gmail messages.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "max_results": {"type": "integer", "default": 10},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "gmail_read_message",
+        "description": "Read a Gmail message.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"message_id": {"type": "string"}},
+            "required": ["message_id"],
+        },
+    },
+    {
+        "name": "gmail_list_messages",
+        "description": "List Gmail messages.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_results": {"type": "integer", "default": 10},
+                "label": {"type": "string", "default": "INBOX"},
             },
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "gmail_read_message",
-            "description": "Read a Gmail message.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "message_id": {"type": "string"},
-                },
-                "required": ["message_id"],
-            },
+        "name": "sap_test_connection",
+        "description": "Check SAP connectivity.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "sap_list_business_partners",
+        "description": "List SAP business partners.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"top": {"type": "integer", "default": 10}},
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "gmail_list_messages",
-            "description": "List Gmail messages.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "max_results": {"type": "integer", "default": 10},
-                    "label": {"type": "string", "default": "INBOX"},
-                },
+        "name": "sap_search_business_partners",
+        "description": "Search SAP business partners.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "top": {"type": "integer", "default": 10},
             },
+            "required": ["name"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "sap_test_connection",
-            "description": "Check SAP connectivity.",
-            "parameters": {"type": "object", "properties": {}},
+        "name": "sap_get_business_partner",
+        "description": "Get SAP business partner details.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"business_partner_id": {"type": "string"}},
+            "required": ["business_partner_id"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "sap_list_business_partners",
-            "description": "List SAP business partners.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "top": {"type": "integer", "default": 10}
-                },
-            },
+        "name": "sap_list_sales_orders",
+        "description": "List SAP sales orders.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"top": {"type": "integer", "default": 10}},
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "sap_search_business_partners",
-            "description": "Search SAP business partners.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "top": {"type": "integer", "default": 10},
-                },
-                "required": ["name"],
-            },
+        "name": "sap_get_sales_order",
+        "description": "Get SAP sales order details.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"sales_order_id": {"type": "string"}},
+            "required": ["sales_order_id"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "sap_get_business_partner",
-            "description": "Get SAP business partner details.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "business_partner_id": {"type": "string"}
-                },
-                "required": ["business_partner_id"],
-            },
+        "name": "sap_list_invoices",
+        "description": "List SAP invoices.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"top": {"type": "integer", "default": 10}},
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "sap_list_sales_orders",
-            "description": "List SAP sales orders.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "top": {"type": "integer", "default": 10}
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "sap_get_sales_order",
-            "description": "Get SAP sales order details.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sales_order_id": {"type": "string"}
-                },
-                "required": ["sales_order_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "sap_list_invoices",
-            "description": "List SAP invoices.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "top": {"type": "integer", "default": 10}
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "sap_get_invoice",
-            "description": "Get SAP invoice details.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "billing_document_id": {"type": "string"}
-                },
-                "required": ["billing_document_id"],
-            },
+        "name": "sap_get_invoice",
+        "description": "Get SAP invoice details.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"billing_document_id": {"type": "string"}},
+            "required": ["billing_document_id"],
         },
     },
 ]
+
+# Guards against the fallback list silently drifting out of sync with the
+# authoritative safety boundary in mcp_client.READ_ONLY_PREFIXES - fails
+# loudly at import time rather than quietly serving an unsafe fallback tool.
+assert all(
+    t["name"].startswith(READ_ONLY_PREFIXES) for t in _FALLBACK_TOOLS_METADATA
+), "_FALLBACK_TOOLS_METADATA contains a tool name outside READ_ONLY_PREFIXES"
 
 
 class AgentError(RuntimeError):
@@ -188,70 +184,56 @@ class EmailAssistant:
             raise AgentError("MISTRAL_API_KEY is missing from the .env file.")
         self._mcp_client = mcp_client
         self._client = Mistral(api_key=MISTRAL_API_KEY)
-        self._tool_impl = {
-            "gmail_search_messages": lambda args:
-                self._mcp_client.gmail_search_messages(
-                    query=args["query"],
-                    max_results=int(args.get("max_results", 10)),
-                ),
+        # Discovered once per EmailAssistant instance (i.e. once per
+        # Streamlit process, since mcp_client/EmailAssistant are cached
+        # resources) rather than per ask() call, so a slow/unreachable
+        # server doesn't add latency to every question. Call
+        # refresh_tools() explicitly if the server's tool set changes
+        # while the app is running.
+        self._tools: list[dict[str, Any]] = []
+        self._allowed_tool_names: set[str] = set()
+        self.refresh_tools()
 
-            "gmail_read_message": lambda args:
-                self._mcp_client.gmail_read_message(
-                    message_id=args["message_id"]
-                ),
+    def refresh_tools(self) -> None:
+        """
+        Rebuild the Mistral tool schema from live, safety-filtered MCP
+        server metadata.
 
-            "gmail_list_messages": lambda args:
-                self._mcp_client.gmail_list_messages(
-                    max_results=int(args.get("max_results", 10)),
-                    label=args.get("label", "INBOX"),
-                ),
+        Uses ``discover_safe_tools()`` (not ``discover_tools()``) so the
+        read-only allowlist in ``mcp_client.READ_ONLY_PREFIXES`` is applied
+        before anything reaches this agent - mutating tools are excluded at
+        the source, not re-filtered here. Falls back to the static
+        read-only tool list if discovery fails (server briefly unreachable,
+        etc.) rather than leaving the agent with zero tools; the fallback
+        list is itself read-only, so no separate filtering is needed for it.
+        """
+        try:
+            safe_tools = self._mcp_client.discover_safe_tools()
+        except (MCPConnectionError, MCPToolError) as exc:
+            logger.warning(
+                "MCP tool discovery failed (%s); falling back to the static tool list.",
+                exc,
+            )
+            safe_tools = _FALLBACK_TOOLS_METADATA
 
-            "sap_test_connection": lambda args:
-                self._mcp_client.sap_test_connection(),
-
-            "sap_list_business_partners": lambda args:
-                self._mcp_client.sap_list_business_partners(
-                    top=int(args.get("top", 10))
-                ),
-
-            "sap_search_business_partners": lambda args:
-                self._mcp_client.sap_search_business_partners(
-                    name=args["name"],
-                    top=int(args.get("top", 10)),
-                ),
-
-            "sap_get_business_partner": lambda args:
-                self._mcp_client.sap_get_business_partner(
-                    business_partner_id=args["business_partner_id"]
-                ),
-
-            "sap_list_sales_orders": lambda args:
-                self._mcp_client.sap_list_sales_orders(
-                    top=int(args.get("top", 10))
-                ),
-
-            "sap_get_sales_order": lambda args:
-                self._mcp_client.sap_get_sales_order(
-                    sales_order_id=args["sales_order_id"]
-                ),
-
-            "sap_list_invoices": lambda args:
-                self._mcp_client.sap_list_invoices(
-                    top=int(args.get("top", 10))
-                ),
-
-            "sap_get_invoice": lambda args:
-                self._mcp_client.sap_get_invoice(
-                    billing_document_id=args["billing_document_id"]
-                ),
-        }
+        self._tools = [_mcp_tool_to_mistral_function(t) for t in safe_tools]
+        self._allowed_tool_names = {t["name"] for t in safe_tools}
+        logger.info(
+            "EmailAssistant tool set ready: %d tool(s) -> %s",
+            len(self._allowed_tool_names),
+            ", ".join(sorted(self._allowed_tool_names)),
+        )
 
     def _run_tool(self, name: str, arguments: dict[str, Any]) -> Any:
-        impl = self._tool_impl.get(name)
-        if impl is None:
-            return {"error": f"Unknown tool '{name}'"}
+        if name not in self._allowed_tool_names:
+            # Backstop, not the primary control: discover_safe_tools()
+            # already excludes mutating tools before self._tools is built,
+            # so the model is never even told this tool exists. This check
+            # is what actually prevents execution if the model hallucinates
+            # a call to something it was never offered.
+            return {"error": f"Tool '{name}' is not available to this agent."}
         try:
-            return impl(arguments)
+            return self._mcp_client.call_tool(name, arguments)
         except (MCPToolError, MCPConnectionError) as exc:
             return {"error": str(exc)}
         except Exception as exc:  # keep the agent loop alive on unexpected errors
@@ -279,7 +261,7 @@ class EmailAssistant:
             response = self._client.chat.complete(
                 model=MISTRAL_MODEL,
                 messages=messages,
-                tools=TOOLS,
+                tools=self._tools,
                 tool_choice="auto",
             )
             message = response.choices[0].message

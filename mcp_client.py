@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import os
 import threading
 from contextlib import AsyncExitStack
@@ -13,9 +14,29 @@ from mcp.types import CallToolResult, TextContent
 
 load_dotenv()
 
+logger = logging.getLogger("mcp_client")
+
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000/mcp").strip()
 MCP_CALL_TIMEOUT_SECONDS = float(os.getenv("MCP_CALL_TIMEOUT_SECONDS", "60"))
 MCP_CONNECT_TIMEOUT_SECONDS = float(os.getenv("MCP_CONNECT_TIMEOUT_SECONDS", "20"))
+
+# Default-deny allowlist for discover_safe_tools(). A tool is only exposed to
+# an LLM agent if its name starts with one of these prefixes - everything
+# else (send, delete, create, update, draft, mark, trash, ...) is excluded
+# automatically, including tools that don't exist yet. This is the project's
+# single safety boundary for dynamic discovery: MCPClient is the one place
+# every agent (Mistral today, anything else later) gets its tool list from,
+# so this is the one place that boundary needs to be enforced.
+READ_ONLY_PREFIXES: tuple[str, ...] = (
+    "gmail_read",
+    "gmail_search",
+    "gmail_list",
+    "gmail_get",
+    "sap_get",
+    "sap_search",
+    "sap_list",
+    "sap_test",
+)
 
 
 class MCPToolError(RuntimeError):
@@ -206,6 +227,103 @@ class MCPClient:
 
     def list_tool_names(self) -> list[str]:
         return self._loop.run(self.list_tools(), timeout=MCP_CALL_TIMEOUT_SECONDS)
+
+    #  dynamic tool discovery 
+
+    async def get_tools_metadata(self) -> list[dict[str, Any]]:
+        """
+        Fetch full tool metadata (name, description, inputSchema) from the
+        MCP server, for feeding into an LLM tool-calling layer.
+
+        ``session.list_tools()`` returns an SDK ``ListToolsResult`` whose
+        ``.tools`` attribute is a list of ``mcp.types.Tool`` pydantic models
+        with fields ``name: str``, ``description: str | None`` and
+        ``inputSchema: dict[str, Any]`` (already a plain JSON-schema dict,
+        no further serialization needed). This mirrors exactly what
+        ``list_tool_names()`` above already relies on for ``tool.name`` -
+        this just also reads the two fields that method discards.
+        """
+        logger.info("Discovering MCP tools...")
+        session = await self._ensure_connected()
+        try:
+            response = await session.list_tools()
+        except Exception as exc:
+            logger.error("Failed to discover MCP tools: %s", exc)
+            raise
+
+        metadata: list[dict[str, Any]] = []
+        for tool in response.tools:
+            metadata.append(
+                {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "inputSchema": tool.inputSchema or {},
+                }
+            )
+
+        logger.info(
+            "Discovered MCP tools:\n%s",
+            "\n".join(f"- {item['name']}" for item in metadata),
+        )
+        logger.info("Successfully discovered %d MCP tools", len(metadata))
+        return metadata
+
+    def discover_tools(self) -> list[dict[str, Any]]:
+        """
+        Synchronous entry point used by EmailAssistant to build its Mistral
+        tool-calling schema from the live MCP server instead of a hardcoded
+        list. Same dispatch pattern as ``call_tool()`` / ``list_tool_names()``
+        - runs on the persistent background loop and blocks for the result.
+
+        Connection failures surface as ``MCPConnectionError`` exactly as they
+        do from ``_ensure_connected()`` / ``_call_tool_async()`` elsewhere in
+        this class; no new exception type is introduced.
+        """
+        return self._loop.run(
+            self.get_tools_metadata(),
+            timeout=MCP_CALL_TIMEOUT_SECONDS,
+        )
+
+    def discover_safe_tools(self) -> list[dict[str, Any]]:
+        """
+        Like ``discover_tools()``, but returns only tools considered safe to
+        hand to an LLM agent: read-only lookups whose name starts with one
+        of ``READ_ONLY_PREFIXES``. Anything else - sends, deletes, creates,
+        updates, drafts, marks, or any tool name that doesn't match a known
+        read-only prefix - is excluded, including tools added to the server
+        after this code was written.
+
+        Built directly on top of ``discover_tools()`` rather than
+        duplicating the discovery/normalization logic: this method only
+        adds a filter, so it inherits ``discover_tools()``'s connection
+        handling, timeout, and ``MCPConnectionError`` propagation unchanged.
+        A discovery failure here is not caught - it must reach the caller so
+        the agent doesn't silently start up with zero (or stale) tools.
+        """
+        all_tools = self.discover_tools()
+        logger.info("Discovered %d MCP tools", len(all_tools))
+
+        safe_tools: list[dict[str, Any]] = []
+        excluded_names: list[str] = []
+
+        for tool in all_tools:
+            name = tool.get("name") if isinstance(tool, dict) else None
+            if not isinstance(name, str) or not name:
+                logger.warning(
+                    "Skipping malformed tool metadata (missing/invalid 'name'): %r",
+                    tool,
+                )
+                continue
+            if name.startswith(READ_ONLY_PREFIXES):
+                safe_tools.append(tool)
+            else:
+                excluded_names.append(name)
+
+        logger.info("Filtered to %d read-only MCP tools", len(safe_tools))
+        for excluded_name in excluded_names:
+            logger.info("Excluded tool: %s", excluded_name)
+
+        return safe_tools
 
     #  Gmail tool wrappers 
 
